@@ -1,60 +1,57 @@
-import pdfplumber
+import pypdf
+import re
 import pandas as pd
-import tkinter as tk
-from tkinter import filedialog, simpledialog, messagebox
-import os
+from datetime import datetime
+from dateutil.relativedelta import relativedelta
 
-def run_converter():
-    # 1. Initialize Tkinter and hide the main window
-    root = tk.Tk()
-    root.withdraw()
-
-    # 2. Ask user to select the PDF file
-    pdf_path = filedialog.askopenfilename(
-        title="Select Equity Bank PDF Statement",
-        filetypes=[("PDF files", "*.pdf")]
-    )
-    if not pdf_path: return
-
-    # 3. Ask for the Output Folder
-    output_folder = filedialog.askdirectory(title="Select Folder to Save Excel File")
-    if not output_folder: return
-
-    # 4. Handle Password Protection
-    password = None
-    try:
-        # Try opening without password first
-        with pdfplumber.open(pdf_path) as pdf:
-            pass
-    except:
-        # If it fails, ask the user for the password
-        password = simpledialog.askstring("Password Required", "Enter PDF Password:", show='*')
-        if not password:
-            messagebox.showerror("Error", "Password is required to open this file.")
-            return
-
-    # 5. Extraction Logic
-    try:
-        all_data = []
-        with pdfplumber.open(pdf_path, password=password) as pdf:
-            for page in pdf.pages:
-                table = page.extract_table()
-                if table:
-                    df_page = pd.DataFrame(table[1:], columns=table[0])
-                    all_data.append(df_page)
+def parse_equity_to_cashflow(pdf_path, password=None):
+    reader = pypdf.PdfReader(pdf_path)
+    if reader.is_encrypted:
+        reader.decrypt(password)
         
-        if all_data:
-            final_df = pd.concat(all_data, ignore_index=True)
-            
-            # Save to Excel
-            output_name = os.path.join(output_folder, "Equity_Analysis_Output.xlsx")
-            final_df.to_excel(output_name, index=False)
-            messagebox.showinfo("Success", f"File saved successfully to:\n{output_name}")
-        else:
-            messagebox.showwarning("No Data", "Could not find any tables in the PDF.")
-            
-    except Exception as e:
-        messagebox.showerror("Processing Error", f"An error occurred: {str(e)}")
+    transactions = []
+    # Pattern: Date1 Date2 Description... Amount Balance
+    pattern = re.compile(r'(\d{2}-\d{2}-\d{4})\s+(\d{2}-\d{2}-\d{4})\s+(.*?)\s+([\d,]+\.\d{2})\s+([\d,]+\.\d{2})')
 
-if __name__ == "__main__":
-    run_converter()
+    for page in reader.pages:
+        text = page.extract_text()
+        lines = text.split('\n')
+        for line in lines:
+            match = pattern.search(line)
+            if match:
+                t_date, _, desc, amt, bal = match.groups()
+                transactions.append({
+                    'Date': datetime.strptime(t_date, '%d-%m-%Y'),
+                    'Description': desc.strip(),
+                    'Amount': float(amt.replace(',', '')),
+                    'Balance': float(bal.replace(',', ''))
+                })
+
+    df = pd.DataFrame(transactions)
+    
+    # Apply Balance Logic to separate Debit/Credit
+    df['Prev_Balance'] = df['Balance'].shift(1)
+    df['Type'] = df.apply(lambda x: 'Credit' if x['Balance'] > x['Prev_Balance'] else 'Debit', axis=1)
+    # Fix the first row manually or based on opening balance
+    
+    return df
+
+def get_6_month_summary(df):
+    today = datetime.now()
+    # 15th Day Rule
+    end_date = today.replace(day=1) - relativedelta(days=1) if today.day <= 15 else today
+    start_date = (end_date - relativedelta(months=5)).replace(day=1)
+    
+    # Filter
+    mask = (df['Date'] >= start_date) & (df['Date'] <= end_date)
+    filtered_df = df.loc[mask].copy()
+    filtered_df['Month'] = filtered_df['Date'].dt.strftime('%Y-%m')
+    
+    summary = filtered_df.groupby(['Month', 'Type'])['Amount'].sum().unstack(fill_value=0)
+    summary['Net Surplus'] = summary.get('Credit', 0) - summary.get('Debit', 0)
+    return summary
+
+# Usage:
+# df = parse_equity_to_cashflow('statement.pdf', 'password123')
+# report = get_6_month_summary(df)
+# report.to_excel('Cashflow_Summary.xlsx')
